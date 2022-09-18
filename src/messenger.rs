@@ -19,6 +19,7 @@ use tokio::{
         oneshot::{channel, Sender},
         Mutex as AsyncMutex,
     },
+    task,
     task::JoinHandle,
 };
 use tracing::{debug, warn};
@@ -274,7 +275,7 @@ where
     pub async fn request<R>(&self, msg: R) -> Result<R::ResponseBody, RequestError>
     where
         R: RequestBody + Send + WriteVersionedType<Vec<u8>>,
-        R::ResponseBody: ReadVersionedType<Cursor<Vec<u8>>>,
+        R::ResponseBody: Send + ReadVersionedType<Cursor<Vec<u8>>> + 'static,
     {
         let body_api_version = self
             .version_ranges
@@ -345,21 +346,32 @@ where
         cleanup_on_cancel.message_sent();
 
         let mut response = rx.await.expect("Who closed this channel?!")?;
-        let body = R::ResponseBody::read_versioned(&mut response.data, body_api_version)?;
 
-        // check if we fully consumed the message, otherwise there might be a bug in our protocol code
-        let read_bytes = response.data.position();
-        let message_bytes = response.data.into_inner().len() as u64;
-        if read_bytes != message_bytes {
-            return Err(RequestError::TooMuchData {
-                message_size: message_bytes,
-                read: read_bytes,
-                api_key: R::API_KEY,
-                api_version: body_api_version,
-            });
-        }
+        // Parsing the response can be CPU-intensive (e.g. 64MB fetch responses can take several
+        // seconds to parse, AFTER all the data has already been downloaded), so move the work off
+        // to a blocking thread.
+        // 
+        // Note: while it's common for tokio runtimes to have multiple worker threads, doing
+        // CPU-intensive work on the worker threads is still not-advised (the CPU-intensive tasks
+        // can block other tasks on the same thread behind it, and tokio work-stealing doesn't seem
+        // anxious to move those tasks to idle worker threads).
+        task::spawn_blocking(move || {
+            let body =
+                R::ResponseBody::read_versioned(&mut response.data, body_api_version)?;
 
-        Ok(body)
+            let read_bytes = response.data.position();
+            let message_bytes = response.data.into_inner().len() as u64;
+            if read_bytes != message_bytes {
+                return Err(RequestError::TooMuchData {
+                    message_size: message_bytes,
+                    read: read_bytes,
+                    api_key: R::API_KEY,
+                    api_version: body_api_version,
+                });
+            }
+
+            Ok(body)
+        }).await.unwrap()
     }
 
     async fn send_message(&self, msg: Vec<u8>) -> Result<(), RequestError> {

@@ -108,7 +108,7 @@ fn send_recv<T>(
 ) -> Result<(), Error>
 where
     T: RequestBody + Send + WriteVersionedType<Vec<u8>>,
-    T::ResponseBody: ReadVersionedType<Cursor<Vec<u8>>>,
+    T::ResponseBody: Send + ReadVersionedType<Cursor<Vec<u8>>> + 'static,
 {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_time()
